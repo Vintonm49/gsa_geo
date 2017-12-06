@@ -1,0 +1,269 @@
+---
+title: "Geospatial Example in R"
+author:  "LTC Melanie Vinton"
+date:  "November 2016"
+output: dscoemarkdown::dscoe
+---
+
+
+This tutorial is another example of munging and mapping geo-spatial data in R.  The purpose is to take a data set with some basic geo-spatial information (in this case, addresses), clean the data, build on with other data, and then create an interactive map of the data using the leaflet package.  It will also demostrate the iterative nature of munging and visualizing.
+
+This tutorial uses data on government properties managed by the General Services Administration in the state of Virginia.  The data was downloaded from the GSA Inventory of Owned and Leased Properties website (http://www.iolp.gsa.gov/iolp/).  
+
+The goal is to map the locations of properties in Virginia including pop-up information, overlay the boundaries of U.S. Congressional Districts, and color the districts based on the number of properties reside in each district.
+
+The first step is to set your working directory to the location of the data files, using the *setwd()* function.  We will also call the packages used in the tutorial up front using the *library()* function.  The order of loading packages can be important.  For example, it's necessary to load the *plyr* package before the *dplyr* package.
+```{r warning = FALSE, message=FALSE, error=FALSE}
+library(plyr)
+library(dplyr)
+library(ggmap)
+library(leaflet)
+library(sp)
+library(rgdal)
+
+```
+
+Next step is to get and inspect the data.  If the file is not in the working directory, be sure to include the full file path in the argument of the *read.csv* function.
+
+```{r}
+VAprop<-read.csv("VA_Govt_Properties.csv")
+names(VAprop)
+```
+
+The data provides a street address, city, state, and zip code for each location.  In order to map the locations using leaflet, you need a latitude and longitude for each building.  The *geocode* function in the *ggmap* package will take a street address (or place name) and return the associated latitude and logitude using Google Maps.
+
+But we need to combine the elements of the location information into a single variable.
+```{r}
+VAprop$Address<-paste(VAprop$STREET_ADDRESS,","," ",VAprop$CITY,","," ","VA", sep="")
+```
+
+Then we can get the latitude and longitude for each location using the *mutate_geocode* function from the *ggmap* package.
+```{r eval=FALSE, message=FALSE, warning=FALSE}
+VAprop2<-VAprop %>% mutate_geocode(Address)
+```
+```{r echo=FALSE}
+VAprop2<-read.csv("VAprop2.csv")
+
+```
+
+
+Now that we have a lat/lon for each location, let's take a look at the data on a quick *leaflet* map.  The *addProviderTiles()* layer adds a basemap and the *addCircleMarkers()* layer adds a red dot for each location listed in the data set.  The popup object in *addCircleMarkers* creates a popup when the dot is clicked on with the information from the data set for that location.  If any of the locations look questionable, we can look at the geospatial information and try to figure out why.
+
+```{r message=FALSE, warning=FALSE}
+test1<- leaflet() %>% 
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addCircleMarkers(data=VAprop2, lng=~lon, lat=~lat, color = "red", radius = 2,
+                   popup=as.character(paste("Latitude:",VAprop2$lat,"<br>",
+                                            "Longitude:",VAprop2$lon,"<br>",
+                                            "Address:", VAprop2$Address)))
+test1
+```
+
+You can see that there are four locations that are clearly not in Virginia.  By clicking the dots and inspecting the geospatial informaiton, one common element across all four is the use of an "&" in the address.  Also, "CRTHSE" should be spelled out to "Courthouse".   Finally, if you zoom into the middle of the state, there is a dot in the center of a state park whose City is "Dulles Airport".  So we need to do some munging using the *sub* and *levels()* functions.
+
+```{r}
+levels(VAprop$STREET_ADDRESS) <- sub("&","and",levels(VAprop$STREET_ADDRESS))
+levels(VAprop$STREET_ADDRESS) <- sub("^8TH&S CRTHSE ROAD$","8th and Courthouse Road",levels(VAprop$STREET_ADDRESS))
+levels(VAprop$CITY) <- sub("DULLES AIRPORT","DULLES",levels(VAprop$CITY))
+
+```
+
+With these corrections, we can correct the **Address** variable.
+```{r}
+VAprop$Address<-NULL
+VAprop$Address<-paste(VAprop$STREET_ADDRESS,","," ",VAprop$CITY,","," ","VA", sep="")
+```
+
+Then we can re-run the geo-coding.
+```{r eval=FALSE}
+VAprop3<-VAprop %>% mutate_geocode(Address)
+```
+```{r echo=FALSE}
+VAprop3<-read.csv("VAprop3.csv")
+```
+
+Looking at the updated map of the data, you see that the dots all fall in Virginia and the location in the state park is gone.  
+```{r}
+test2<- leaflet() %>% 
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addCircleMarkers(data=VAprop3, lng=~lon, lat=~lat, color = "red", radius = 2,
+                   popup=as.character(paste("Latitude:",VAprop3$lat,"<br>",
+                                            "Longitude:",VAprop3$lon,"<br>",
+                                            "Address:", VAprop3$Address)))
+test2
+```
+
+
+### Add Congressional District Data
+Now we want to explore the inforation on the Virginia Congressional Districts and visualize how GSA building align with these districts.  The approach can answer questions such as: which representatives have the most GSA buildings in their districts?
+
+```{r message=FALSE, warning=FALSE}
+VArep<-ddply(VAprop3, c("REPRESENTATIVE","CONGRESSIONAL_DISTRICT_CODE"), summarize, reptot=length(LOCATION_CODE))
+
+VArep
+```
+
+The state of Virginia has 11 congressional districts but analysis of the representatives table shows some error in the data.  Congressional District Code 1198 is incorrect.  We change it to "No value" using the *sub()* function.  Then we re-build the district summary.
+```{r}
+levels(VAprop3$CONGRESSIONAL_DISTRICT_CODE) <- sub(1198,"No value",levels(VAprop3$CONGRESSIONAL_DISTRICT_CODE))
+
+VArep<-ddply(VAprop3, c("REPRESENTATIVE","CONGRESSIONAL_DISTRICT_CODE"), summarize, reptot=length(LOCATION_CODE))
+
+VArep
+```
+
+We will deal with the "undefined" in the Representative field later.
+
+### Add Congressional Districts to the Map
+We want to create a map that includes the boundaries of the Congressional Districts.  The Census Bureau provides shapefiles of all Congressional districts on its website under TIGER products.  To bring in the shapefile, we need the *readOGR()* function in the *rgdal* package.  Then we will subset it to just districts in Virginia using the Federal Information Processing Standard code (or FP / FIP), which is 51 for Virginia.
+
+```{r warning=FALSE, message=FALSE}
+districts<-readOGR(dsn='Congressional_2015_us_5m', layer='cb_2015_us_cd114_5m')
+dist51VA<-districts[districts$STATEFP==51,]
+plot(dist51VA)
+```
+
+Next we want to add the name of the **Representative** to each district in the shapefile.  First we need to match the name of the district code variable in each object.  In the **dist51VA** shapefile, the code is called **GEOID**, so we'll use the *rename* function in the *dplyr* package to change the variable **CONGRESSIONAL_DISTRICT_CODE** in the **VAprop3** dataframe.
+
+```{r}
+names(dist51VA)
+names(VAprop3)
+VAprop3<-rename(VAprop3,GEOID = CONGRESSIONAL_DISTRICT_CODE)
+names(VAprop3)
+```
+
+Before we continue, we need to deal with some missing data.  The properties that have "undefined" in the **Representative** field also have "No Value" for the **GEOID** field.   The plan is to use the **dist51VA** shapefile to figure out which district the properties fall into and update the **GEOID** and **Representative** fields accordingly. 
+
+The first step is to convert the **VAprop3** dataframe to a Spatial Points Data Frame by identifying the coordinates using the *coordinates* function in the *sp* package and then map the projection of the **dist51VA** shapefile to **VAprop3** using the *proj4string* and *CRS* functions.
+```{r}
+coordinates(VAprop3)<-~lon+lat
+proj4string(VAprop3)<-CRS(proj4string(dist51VA))
+```
+The next steps will be repeated for each of the 11 districts in VA.
+
+First, subset **dist51VA** to make a new shapefile for the district based on the GEOID of the district.
+```{r}
+dist5101<-dist51VA[dist51VA$GEOID==5101,]
+```
+Next, subset the properties spatial dataframe, **VAprop3**, using the new district shapefile.  This is essentially like a "clip" in geospatial analysis.
+```{r}
+Prop5101<-VAprop3[dist5101,]
+```
+Next, convert the **Prop5101** spatial dataframe back to a regular dataframe.
+```{r}
+Prop5101df<-as.data.frame(Prop5101)
+```
+Finally, update the **GEOID** and **REPRESENTATIVE** information in the new district specific dataframe with the correct information using the *sub* function.
+```{r}
+levels(Prop5101df$GEOID) <- sub("No value",5101,levels(Prop5101df$GEOID))
+levels(Prop5101df$REPRESENTATIVE) <- sub("undefined","Wittman, Robert J. (R)",levels(Prop5101df$REPRESENTATIVE))
+```
+These steps are repeated for the next 10 districts by changing the GEOID number (in this example, 5101) referenced throughout the code.  The result will be 11 dataframes, one for each district.
+```{r echo=FALSE}
+dist5102<-dist51VA[dist51VA$GEOID==5102,]
+Prop5102<-VAprop3[dist5102,]
+Prop5102df<-as.data.frame(Prop5102)
+levels(Prop5102df$GEOID) <- sub("No value",5102,levels(Prop5102df$GEOID))
+levels(Prop5102df$REPRESENTATIVE) <- sub("undefined","Rigell, Scott (R)",levels(Prop5102df$REPRESENTATIVE))
+
+dist5103<-dist51VA[dist51VA$GEOID==5103,]
+Prop5103<-VAprop3[dist5103,]
+Prop5103df<-as.data.frame(Prop5103)
+levels(Prop5103df$GEOID) <- sub("No value",5103,levels(Prop5103df$GEOID))
+levels(Prop5103df$REPRESENTATIVE) <- sub("undefined","Scott, Robert C. (D)",levels(Prop5103df$REPRESENTATIVE))
+
+dist5104<-dist51VA[dist51VA$GEOID==5104,]
+Prop5104<-VAprop3[dist5104,]
+Prop5104df<-as.data.frame(Prop5104)
+levels(Prop5104df$GEOID) <- sub("No value",5104,levels(Prop5104df$GEOID))
+levels(Prop5104df$REPRESENTATIVE) <- sub("undefined","Forbes, J. Randy (R)",levels(Prop5104df$REPRESENTATIVE))
+
+dist5105<-dist51VA[dist51VA$GEOID==5105,]
+Prop5105<-VAprop3[dist5105,]
+Prop5105df<-as.data.frame(Prop5105)
+levels(Prop5105df$GEOID) <- sub("No value",5105,levels(Prop5105df$GEOID))
+levels(Prop5105df$REPRESENTATIVE) <- sub("undefined","Hurt, Robert (R)",levels(Prop5105df$REPRESENTATIVE))
+
+dist5106<-dist51VA[dist51VA$GEOID==5106,]
+Prop5106<-VAprop3[dist5106,]
+Prop5106df<-as.data.frame(Prop5106)
+levels(Prop5106df$GEOID) <- sub("No value",5106,levels(Prop5106df$GEOID))
+levels(Prop5106df$REPRESENTATIVE) <- sub("undefined","Goodlatte, Bob (R)",levels(Prop5106df$REPRESENTATIVE))
+
+dist5107<-dist51VA[dist51VA$GEOID==5107,]
+Prop5107<-VAprop3[dist5107,]
+Prop5107df<-as.data.frame(Prop5107)
+levels(Prop5107df$GEOID) <- sub("No value",5107,levels(Prop5107df$GEOID))
+levels(Prop5107df$REPRESENTATIVE) <- sub("undefined","Brat, Dave (R)",levels(Prop5107df$REPRESENTATIVE))
+
+dist5108<-dist51VA[dist51VA$GEOID==5108,]
+Prop5108<-VAprop3[dist5108,]
+Prop5108df<-as.data.frame(Prop5108)
+levels(Prop5108df$GEOID) <- sub("No value",5108,levels(Prop5108df$GEOID))
+levels(Prop5108df$REPRESENTATIVE) <- sub("undefined","Beyer, Don (D)",levels(Prop5108df$REPRESENTATIVE))
+
+dist5109<-dist51VA[dist51VA$GEOID==5109,]
+Prop5109<-VAprop3[dist5109,]
+Prop5109df<-as.data.frame(Prop5109)
+levels(Prop5109df$GEOID) <- sub("No value",5109,levels(Prop5109df$GEOID))
+levels(Prop5109df$REPRESENTATIVE) <- sub("undefined","Griffith, Morgan (R)",levels(Prop5109df$REPRESENTATIVE))
+
+dist5110<-dist51VA[dist51VA$GEOID==5110,]
+Prop5110<-VAprop3[dist5110,]
+Prop5110df<-as.data.frame(Prop5110)
+levels(Prop5110df$GEOID) <- sub("No value",5110,levels(Prop5110df$GEOID))
+levels(Prop5110df$REPRESENTATIVE) <- sub("undefined","Comstock, Barbara (R)",levels(Prop5110df$REPRESENTATIVE))
+
+dist5111<-dist51VA[dist51VA$GEOID==5111,]
+Prop5111<-VAprop3[dist5111,]
+Prop5111df<-as.data.frame(Prop5111)
+levels(Prop5111df$GEOID) <- sub("No value",5111,levels(Prop5111df$GEOID))
+levels(Prop5111df$REPRESENTATIVE) <- sub("undefined","Connolly, Gerald E. Gerry (D)",levels(Prop5111df$REPRESENTATIVE))
+
+```
+We combine the district dataframes back into one using the *rbind* function.  This essentially recreates the original data set but with the missing data filled in, as seen in the table below.
+```{r}
+VAprop_imp<-rbind(Prop5101df,Prop5102df,Prop5103df,Prop5104df,Prop5105df,Prop5106df,Prop5107df,Prop5108df,Prop5109df,Prop5110df,Prop5111df)
+
+distreps<-ddply(VAprop_imp, c("GEOID","REPRESENTATIVE"), summarize, reptot=length(LOCATION_CODE))
+distreps
+```
+
+
+
+We'll use the *merge* function to join the Representative variable to the **dist51VA** shapefile using **GEOID** as the key pair.
+```{r}
+dist51VA3<-merge(dist51VA,distreps, by = "GEOID")
+```
+
+Now we can build our map.  First, we need to set a palette for colors used to indicate the number of properties in a district using the *colorQuantile()* function in the *leaflet* package.
+```{r}
+distpal<-colorQuantile(palette="Purples", domain = dist51VA3$reptot,n=3)
+```
+
+We start our map with a map widget by calling *leaflet()*.  Then we add layers.  The *setview()* function focuses the basemap on Virginia. The *addProviderTiles()* layer is the basemap.  
+
+Next we will add the outline of the districts with the first *addPolygons()* layer.  The next *addPolygons()* layer colors the districts different shades of purples based on the number of properties in the district from the **reptot** variable and using the palette defined above.  It also creates a popup when the district is selected with the name of the Representative for the district.  The *addCircleMarkers()* layer is the same as the initial maps, with a popup that indicates the name of the **Representative** and **City** the property is located in.  
+
+We'd like to be able to turn layers on and off intereactively in the map, so each layer has a *group* argument.  The *addLayersControl()* layer defines the groups and creates the toggle on the map. 
+
+```{r}
+test3<- leaflet() %>% 
+  setView(lng = -77.552580, lat = 37.552488, zoom = 7) %>%
+  addProviderTiles("Esri.WorldTopoMap") %>%
+  addPolygons(data=dist51VA3, fillOpacity=0, weight = 1, color="black",
+              group = "Districts") %>%
+  addPolygons(data=dist51VA3, fillOpacity=.2, fillColor= ~distpal(reptot), 
+              color = 'purple',weight = .9, popup=~REPRESENTATIVE,
+              group = "Districts Colored")%>%
+  addCircleMarkers(data=VAprop_imp, lng=~lon, lat=~lat, color = "red", radius = 2,
+                   group = "Properties",
+                   popup=as.character(paste("US Rep:",VAprop_imp$REPRESENTATIVE,"<br>",
+                                            "City:", VAprop_imp$CITY))) %>%
+  addLayersControl(overlayGroups = c("Districts","Districts Colored", "Properties"),
+                   options=layersControlOptions(collapsed=FALSE))
+test3
+```
+
+Hopefully this tutorial provides some useful techniques for munging and visualizing geospatial data.
+
